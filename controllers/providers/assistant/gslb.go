@@ -25,10 +25,6 @@ import (
 	"strings"
 	"time"
 
-	k8gbv1beta1 "github.com/k8gb-io/k8gb/api/v1beta1"
-	"github.com/k8gb-io/k8gb/controllers/internal/utils"
-	"github.com/k8gb-io/k8gb/controllers/logging"
-
 	"github.com/miekg/dns"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
@@ -37,6 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	externaldns "sigs.k8s.io/external-dns/endpoint"
+
+	k8gbv1beta1 "github.com/k8gb-io/k8gb/api/v1beta1"
+	"github.com/k8gb-io/k8gb/controllers/internal/utils"
+	"github.com/k8gb-io/k8gb/controllers/logging"
 )
 
 const coreDNSServiceLabel = "app.kubernetes.io/name=coredns"
@@ -281,11 +281,20 @@ func getARecords(msg *dns.Msg) []string {
 	return ARecords
 }
 
-func dnsQuery(host string, nameservers utils.DNSList) (*dns.Msg, error) {
+func getAAAARecords(msg *dns.Msg) []string {
+	var AAAARecords []string
+	for _, nsAAAA := range msg.Answer {
+		ip := nsAAAA.(*dns.AAAA).AAAA.String()
+		AAAARecords = append(AAAARecords, ip)
+	}
+	return AAAARecords
+}
+
+func dnsQuery(host string, nameservers utils.DNSList, rtype uint16) (*dns.Msg, error) {
 	dnsMsg := new(dns.Msg)
 	fqdn := fmt.Sprintf("%s.", host) // Convert to true FQDN with dot at the end
-	dnsMsg.SetQuestion(fqdn, dns.TypeA)
-	dnsMsgA, err := utils.Exchange(dnsMsg, nameservers)
+	dnsMsg.SetQuestion(fqdn, rtype)
+	dnsMsgAns, err := utils.Exchange(dnsMsg, nameservers)
 	if err != nil {
 		log.Warn().
 			Str("fqdn", fqdn).
@@ -293,7 +302,7 @@ func dnsQuery(host string, nameservers utils.DNSList) (*dns.Msg, error) {
 			Err(err).
 			Msg("can't resolve FQDN using nameservers")
 	}
-	return dnsMsgA, err
+	return dnsMsgAns, err
 }
 
 func (r *Gslb) GetExternalTargets(host string, extClusterNsNames map[string]string) (targets Targets) {
@@ -303,29 +312,58 @@ func (r *Gslb) GetExternalTargets(host string, extClusterNsNames map[string]stri
 		log.Info().
 			Str("cluster", cluster).
 			Msg("Adding external Gslb targets from cluster")
-		glueA, err := dnsQuery(cluster, r.edgeDNSServers)
+		glueA, err := dnsQuery(cluster, r.edgeDNSServers, dns.TypeA)
 		if err != nil {
+			log.Info().Err(err).Msg("Unable to fetch A record")
+			return
+		}
+		glueAAAA, err := dnsQuery(cluster, r.edgeDNSServers, dns.TypeAAAA)
+		if err != nil {
+			log.Info().Err(err).Msg("Unable to fetch AAAA record")
 			return
 		}
 		log.Info().
 			Str("nameserver", cluster).
 			Interface("edgeDNSServers", r.edgeDNSServers).
 			Interface("glueARecord", glueA.Answer).
+			Interface("glueAAAARecord", glueAAAA.Answer).
 			Msg("Resolved glue A record for NS")
 		glueARecords := getARecords(glueA)
-		var hostToUse string
+		glueAAAARecords := getAAAARecords(glueAAAA)
+
+		var hostsToUse []string
+		useCluster := true
+		if len(glueARecords) > 0 {
+			hostsToUse = append(hostsToUse, glueARecords[0])
+			useCluster = false
+		}
+		if len(glueAAAARecords) > 0 {
+			hostsToUse = append(hostsToUse, glueARecords[0])
+			useCluster = false
+		}
+		if useCluster {
+			hostsToUse = append(hostsToUse, cluster)
+		}
+
+		/*
 		if len(glueARecords) > 0 {
 			hostToUse = glueARecords[0]
 		} else {
 			hostToUse = cluster
-		}
-		nameServersToUse := getNSCombinations(r.edgeDNSServers, hostToUse)
+		}*/
+
+		nameServersToUse := getNSCombinations(r.edgeDNSServers, hostsToUse)
 		lHost := fmt.Sprintf("localtargets-%s", host)
-		a, err := dnsQuery(lHost, nameServersToUse)
+		a, err := dnsQuery(lHost, nameServersToUse, dns.TypeA)
+		if err != nil {
+			return
+		}
+		aaaa, err := dnsQuery(lHost, nameServersToUse, dns.TypeAAAA)
 		if err != nil {
 			return
 		}
 		clusterTargets := getARecords(a)
+		clusterTargets = append(clusterTargets, getAAAARecords(aaaa)...)
 		if len(clusterTargets) > 0 {
 			targets[tag] = &Target{clusterTargets}
 			log.Info().
@@ -337,30 +375,44 @@ func (r *Gslb) GetExternalTargets(host string, extClusterNsNames map[string]stri
 	return targets
 }
 
-func getNSCombinations(original []utils.DNSServer, hostToUse string) []utils.DNSServer {
+func getNSCombinations(original []utils.DNSServer, hostsToUse []string) []utils.DNSServer {
 	portToUse := original[0].Port
+
+	var nameServerToUse []utils.DNSServer
+	for _, hostToUse := range hostsToUse {
+		nameServerToUse = append(nameServerToUse, utils.DNSServer{
+			Host: hostToUse,
+			Port: portToUse,
+		})
+	}
+	/*
 	nameServerToUse := []utils.DNSServer{
 		{
 			Host: hostToUse,
 			Port: portToUse,
-		},
-	}
+		}
+	}*/
 	defaultPortAdded := false
 	for _, s := range original {
 		if s.Port != 53 {
-			nameServerToUse = append(nameServerToUse, utils.DNSServer{
-				Host: hostToUse,
-				Port: s.Port,
-			})
+			for _, hostToUse := range hostsToUse {
+				nameServerToUse = append(nameServerToUse, utils.DNSServer{
+					Host: hostToUse,
+					Port: s.Port,
+				})
+			}
 		} else {
 			defaultPortAdded = true
 		}
 	}
+
 	if !defaultPortAdded {
-		nameServerToUse = append(nameServerToUse, utils.DNSServer{
-			Host: hostToUse,
-			Port: 53,
-		})
+		for _, hostToUse := range hostsToUse {
+			nameServerToUse = append(nameServerToUse, utils.DNSServer{
+				Host: hostToUse,
+				Port: 53,
+			})
+		}
 	}
 	return nameServerToUse
 }

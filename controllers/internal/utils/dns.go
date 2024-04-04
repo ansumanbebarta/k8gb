@@ -58,6 +58,8 @@ func Dig(fqdn string, edgeDNSServers ...DNSServer) (ips []string, err error) {
 	if !strings.HasSuffix(fqdn, ".") {
 		fqdn += "."
 	}
+	
+	// Dig for A records
 	msg := new(dns.Msg)
 	msg.SetQuestion(fqdn, dns.TypeA)
 	ack, err := Exchange(msg, edgeDNSServers)
@@ -66,6 +68,17 @@ func Dig(fqdn string, edgeDNSServers ...DNSServer) (ips []string, err error) {
 	}
 	for _, a := range ack.Answer {
 		ips = append(ips, a.(*dns.A).A.String())
+	}
+
+	// Dig for AAAA records
+	msg = new(dns.Msg)
+	msg.SetQuestion(fqdn, dns.TypeAAAA)
+	ack, err = Exchange(msg, edgeDNSServers)
+	if err != nil {
+		return nil, fmt.Errorf("dig error: %s", err)
+	}
+	for _, a := range ack.Answer {
+		ips = append(ips, a.(*dns.AAAA).AAAA.String())
 	}
 	sort.Strings(ips)
 	return

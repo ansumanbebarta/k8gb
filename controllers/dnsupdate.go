@@ -64,7 +64,7 @@ func (r *GslbReconciler) gslbDNSEndpoint(gslb *k8gbv1beta1.Gslb) (*externaldns.D
 			dnsRecord := &externaldns.Endpoint{
 				DNSName:    localTargetsHost,
 				RecordTTL:  ttl,
-				RecordType: "A",
+				RecordType: "AAAA",
 				Targets:    localTargets,
 			}
 			gslbHosts = append(gslbHosts, dnsRecord)
@@ -121,7 +121,7 @@ func (r *GslbReconciler) gslbDNSEndpoint(gslb *k8gbv1beta1.Gslb) (*externaldns.D
 			dnsRecord := &externaldns.Endpoint{
 				DNSName:    host,
 				RecordTTL:  ttl,
-				RecordType: "A",
+				RecordType: "AAAA",
 				Targets:    finalTargets.GetIPs(),
 				Labels: externaldns.Labels{
 					"strategy": gslb.Spec.Strategy.Type,
